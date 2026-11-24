@@ -18,11 +18,22 @@ interface Contact : SavableSearchable {
     val postalAddresses: List<PostalAddress>
     val customActions: List<CustomContactAction>
 
+    /**
+     * The company (organization) the contact works for, if known.
+     */
+    val company: String?
+        get() = null
+
     override val label: String
         get() = name
 
+    /**
+     * A short description of the contact, shown below its name in search results: its company if
+     * known, otherwise its phone numbers and email addresses.
+     */
     val summary: String
         get() {
+            company?.takeIf { it.isNotBlank() }?.let { return it }
             return (phoneNumbers.map { it.number } + emailAddresses.map { it.address })
                 .joinToString(", ")
         }
