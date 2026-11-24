@@ -1,4 +1,6 @@
 import java.time.LocalDate
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -168,4 +170,58 @@ dependencies {
 
     // Uncomment this if you want annoying notifications in your debug builds
     //debugImplementation(libs.leakcanary)
+}
+
+// ---------------------------------------------------------------------------
+// Fork additions (see FORK.md). Kept in a single block at the end of the file
+// so that rebasing onto upstream stays conflict-free.
+// ---------------------------------------------------------------------------
+
+/** Current UTC hour as yyyyMMddHH; a ValueSource so the configuration cache never reuses a stale value. */
+abstract class ForkUtcHour : ValueSource<String, ValueSourceParameters.None> {
+    override fun obtain(): String =
+        ZonedDateTime.now(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("yyyyMMddHH"))
+}
+
+// Used for both versionCode and the versionName suffix of the fork build type.
+val forkBuildId: String = providers.environmentVariable("FORK_BUILD_ID")
+    .orElse(providers.of(ForkUtcHour::class) {})
+    .get()
+require(Regex("""\d{10}""").matches(forkBuildId) && forkBuildId.toLong() < 2_100_000_000L) {
+    "FORK_BUILD_ID must be yyyyMMddHH and below 2100000000, got '$forkBuildId'"
+}
+
+// Release keystore: $KEYSTORE_FILE locally, $RUNNER_TEMP/keystore/keystore.jks on GitHub Actions.
+// Without one, the fork build type falls back to debug signing so local builds keep working.
+val forkKeystore: File? = (System.getenv("KEYSTORE_FILE")
+    ?: System.getenv("RUNNER_TEMP")?.let { "$it/keystore/keystore.jks" })
+    ?.let { file(it) }
+    ?.takeIf { it.isFile }
+
+android {
+    signingConfigs {
+        if (forkKeystore != null) {
+            create("fork") {
+                storeFile = forkKeystore
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+                keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        create("fork") {
+            initWith(getByName("release"))
+            matchingFallbacks += "release"
+            applicationIdSuffix = ".fork"
+            versionNameSuffix = "-fork.$forkBuildId"
+            signingConfig = signingConfigs.findByName("fork") ?: signingConfigs.getByName("debug")
+        }
+    }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("fork")) { variant ->
+        variant.outputs.forEach { it.versionCode.set(forkBuildId.toInt()) }
+    }
 }

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Distinguishes the fork's launcher icon from the official build (#04327D). -->
+    <color name="ic_launcher_background">#6A1B9A</color>
+</resources>

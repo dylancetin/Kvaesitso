@@ -1,0 +1,170 @@
+# Rebases the fork's main branch onto upstream (MM2-0/Kvaesitso) every week. On success the
+# force-push triggers fork-release.yml; on conflict an issue is opened instead. See FORK.md.
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/MM2-0/Kvaesitso.git
+  CONFLICT_LABEL: upstream-sync-conflict
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require SYNC_TOKEN
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [[ -z "$SYNC_TOKEN" ]]; then
+            echo "::error::The SYNC_TOKEN secret is missing. Add a fine-grained PAT with Contents and Workflows write access to this repository (GITHUB_TOKEN cannot push commits that modify .github/workflows)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+
+      - name: Rebase onto upstream
+        id: rebase
+        run: |
+          set -euo pipefail
+          orig=$(git rev-parse HEAD)
+          upstream=$(git rev-parse upstream/main)
+          echo "orig=$orig" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream" "$orig"; then
+            echo "main already contains upstream/main ($upstream); nothing to do."
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          range="$(git merge-base "$upstream" "$orig")..$upstream"
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+          echo "Fork commits on top of upstream:"
+          git log --oneline "upstream/main..$orig"
+
+          if git rebase upstream/main; then
+            echo "status=rebased" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "status=conflict"
+            echo "stopped=$(git log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || echo unknown)"
+            echo "files<<EOF_FILES"
+            git diff --name-only --diff-filter=U
+            echo "EOF_FILES"
+          } >> "$GITHUB_OUTPUT"
+          git rebase --abort
+
+      - name: Push rebased main
+        if: steps.rebase.outputs.status == 'rebased'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIG: ${{ steps.rebase.outputs.orig }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease="main:$ORIG" origin HEAD:main
+          head=$(git rev-parse HEAD)
+
+          # The PAT push normally triggers fork-release.yml via the push event. If no run shows up,
+          # dispatch it explicitly (fork-release skips commits that are already released).
+          for _ in $(seq 1 12); do
+            sleep 10
+            if [[ -n "$(gh run list --workflow fork-release.yml --commit "$head" --json databaseId --jq '.[].databaseId')" ]]; then
+              echo "fork-release.yml was triggered for $head."
+              exit 0
+            fi
+          done
+          echo "::warning::No fork-release run appeared for $head; dispatching it explicitly."
+          gh workflow run fork-release.yml --ref main
+
+      - name: Close resolved conflict issues
+        if: steps.rebase.outputs.status == 'rebased' || steps.rebase.outputs.status == 'up-to-date'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != "true" ]]; then
+            exit 0
+          fi
+          for n in $(gh issue list --label "$CONFLICT_LABEL" --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Resolved: main is now based on upstream/main ($(git rev-parse --short upstream/main))."
+          done
+
+      - name: Report rebase conflict
+        if: steps.rebase.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RANGE: ${{ steps.rebase.outputs.range }}
+          FILES: ${{ steps.rebase.outputs.files }}
+          STOPPED: ${{ steps.rebase.outputs.stopped }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "The weekly upstream sync could not rebase \`main\` onto \`upstream/main\` automatically."
+            echo
+            echo "**Upstream commit range:** [\`$RANGE\`](https://github.com/MM2-0/Kvaesitso/compare/${RANGE/../...})"
+            echo
+            echo "**Fork commit that failed to apply:** $STOPPED"
+            echo
+            echo "**Conflicting files:**"
+            while IFS= read -r f; do [[ -n "$f" ]] && echo "- \`$f\`"; done <<<"$FILES"
+            echo
+            echo "Resolve locally:"
+            echo
+            echo '```sh'
+            echo 'git fetch upstream && git checkout main && git rebase upstream/main'
+            echo '# fix conflicts, git rebase --continue, then:'
+            echo 'git push --force-with-lease origin main'
+            echo '```'
+            echo
+            echo "Workflow run: $RUN_URL"
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != "true" ]]; then
+            echo "::error::Rebase onto upstream/main failed, and issues are disabled on this repository, so no issue was opened. See the job summary for details."
+            exit 1
+          fi
+
+          gh label create "$CONFLICT_LABEL" --color B60205 \
+            --description "Automatic upstream rebase hit a conflict" --force
+
+          existing=$(gh issue list --label "$CONFLICT_LABEL" --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$existing" ]]; then
+            echo "Conflict issue #$existing is already open; adding a comment."
+            gh issue comment "$existing" --body-file "$body"
+          else
+            gh issue create --title "Upstream sync conflict" --label "$CONFLICT_LABEL" --body-file "$body"
+          fi
+          echo "::error::Rebase onto upstream/main failed; see the upstream-sync-conflict issue."
+          exit 1
