@@ -87,6 +87,7 @@ internal class AndroidContactProvider(
             var firstName: String? = null
             var lastName: String? = null
             var displayName: String? = null
+            var company: String? = null
             val phoneNumbers = mutableListOf<PhoneNumber>()
             val emailAddresses = mutableListOf<EmailAddress>()
             val postalAddresses = mutableListOf<PostalAddress>()
@@ -107,13 +108,19 @@ internal class AndroidContactProvider(
                 dataCursor.getColumnIndex(ContactsContract.CommonDataKinds.StructuredName.GIVEN_NAME)
             val familyNameColumn =
                 dataCursor.getColumnIndex(ContactsContract.CommonDataKinds.StructuredName.FAMILY_NAME)
+            val companyColumn =
+                dataCursor.getColumnIndex(ContactsContract.CommonDataKinds.Organization.COMPANY)
             val accountTypeColumn =
                 dataCursor.getColumnIndex(ContactsContract.Data.ACCOUNT_TYPE_AND_DATA_SET)
 
             val data3Column = dataCursor.getColumnIndex(ContactsContract.Data.DATA3)
             val idColumn = dataCursor.getColumnIndex(ContactsContract.Data._ID)
             loop@ while (dataCursor.moveToNext()) {
-                when (dataCursor.getStringOrNull(mimeTypeColumn)) {
+                val mimeType = dataCursor.getStringOrNull(mimeTypeColumn)
+                if (company == null && mimeType == ContactsContract.CommonDataKinds.Organization.CONTENT_ITEM_TYPE) {
+                    company = dataCursor.getStringOrNull(companyColumn)?.takeIf { it.isNotBlank() }
+                }
+                when (mimeType) {
                     ContactsContract.CommonDataKinds.Email.CONTENT_ITEM_TYPE ->
                         dataCursor.getStringOrNull(emailAddressColumn)?.let {
                             emailAddresses += EmailAddress(
@@ -211,7 +218,8 @@ internal class AndroidContactProvider(
                 emailAddresses = emailAddresses.distinct(),
                 postalAddresses = postalAddresses.distinct(),
                 customActions = customActions.distinct(),
-                lookupKey = lookUpKey
+                lookupKey = lookUpKey,
+                company = company,
             )
         }
 

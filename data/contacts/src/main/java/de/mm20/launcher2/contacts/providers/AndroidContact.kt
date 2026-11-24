@@ -30,17 +30,13 @@ internal data class AndroidContact(
     override val postalAddresses: List<PostalAddress>,
     override val customActions: List<CustomContactAction>, internal val lookupKey: String,
     override val labelOverride: String? = null,
+    override val company: String? = null,
 ) : Contact {
 
 
     override val domain: String = Domain
     override val key: String
         get() = "$Domain://$id"
-
-    override val summary: String
-        get() {
-            return (phoneNumbers.map { it.number } + emailAddresses.map { it.address }).joinToString(", ")
-        }
 
     override fun overrideLabel(label: String): Contact {
         return copy(labelOverride = label)
