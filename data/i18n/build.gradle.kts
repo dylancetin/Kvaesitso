@@ -52,4 +52,6 @@ dependencies {
     implementation(project(":core:crashreporter"))
     implementation(project(":core:preferences"))
 
+    testImplementation(libs.bundles.tests)
+
 }
