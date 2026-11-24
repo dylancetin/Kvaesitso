@@ -13,8 +13,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
-import org.apache.commons.lang3.StringUtils
-import java.util.Locale
 
 @RequiresApi(29)
 internal class IcuStringNormalizer(
@@ -53,10 +51,7 @@ internal class IcuStringNormalizer(
         }
 
         if (transliterator ==  null) {
-            return StringUtils.stripAccents(input.lowercase(Locale.getDefault()))
-                .replace("æ", "ae")
-                .replace("œ", "oe")
-                .replace("ß", "ss")
+            return CompatStringNormalizer.compatNormalize(input)
         }
 
         return transliterator.transliterate(input).lowercase()

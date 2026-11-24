@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Build
 import android.provider.ContactsContract
 import android.telephony.PhoneNumberUtils
+import android.util.Log
 import androidx.core.database.getLongOrNull
 import androidx.core.database.getStringOrNull
 import de.mm20.launcher2.ktx.distinctByEquality
@@ -32,12 +33,31 @@ internal class AndroidContactProvider(
                 ContactsContract.RawContacts.CONTACT_ID,
                 ContactsContract.RawContacts._ID
             )
-            val sel =
-                "${ContactsContract.RawContacts.DISPLAY_NAME_PRIMARY} LIKE ? OR ${ContactsContract.RawContacts.DISPLAY_NAME_ALTERNATIVE} LIKE ? OR ${ContactsContract.RawContacts.PHONETIC_NAME} LIKE ? OR ${ContactsContract.RawContacts.SORT_KEY_PRIMARY} LIKE ?"
-            val selArgs = arrayOf("%$query%", "%$query%", "%$query%", "%$query%")
-            val cursor = context.contentResolver.query(
-                ContactsContract.RawContacts.CONTENT_URI, proj, sel, selArgs, null
-            ) ?: return@withContext mutableListOf()
+            val columns = listOf(
+                ContactsContract.RawContacts.DISPLAY_NAME_PRIMARY,
+                ContactsContract.RawContacts.DISPLAY_NAME_ALTERNATIVE,
+                ContactsContract.RawContacts.PHONETIC_NAME,
+                ContactsContract.RawContacts.SORT_KEY_PRIMARY,
+            )
+            // LIKE only ignores the case of ASCII letters (so "ismail" would not find "İsmail"),
+            // GLOB with per-letter character classes ignores case and accents of all letters.
+            val cursor = try {
+                val glob = ContactNamePattern.glob(query)
+                context.contentResolver.query(
+                    ContactsContract.RawContacts.CONTENT_URI, proj,
+                    columns.joinToString(" OR ") { "$it GLOB ?" },
+                    Array(columns.size) { glob }, null
+                )
+            } catch (e: RuntimeException) {
+                // Not expected, but contacts providers may restrict the SQL they accept
+                // (IllegalArgumentException, SQLiteException).
+                Log.w("AndroidContactProvider", "GLOB query failed, falling back to LIKE", e)
+                context.contentResolver.query(
+                    ContactsContract.RawContacts.CONTENT_URI, proj,
+                    columns.joinToString(" OR ") { "$it LIKE ?" },
+                    Array(columns.size) { "%$query%" }, null
+                )
+            } ?: return@withContext mutableListOf()
             //Maps raw contact ids to contact ids
             val contactMap = mutableMapOf<Long, MutableSet<Long>>()
             while (cursor.moveToNext()) {
