@@ -1,0 +1,166 @@
+# Builds the side-by-side "fork" build type (de.mm20.launcher2.fork), signs it with the fork key
+# and publishes it as a GitHub release that Obtainium can track. See FORK.md.
+name: Fork release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release (only honoured on main; otherwise the APK is uploaded as an artifact)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Plan version
+        id: plan
+        env:
+          WANT_PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          set -euo pipefail
+          publish=false
+          if [[ "$WANT_PUBLISH" == "true" ]]; then
+            if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+              publish=true
+            else
+              echo "::warning::Releases are only published from main; uploading the APK as an artifact instead."
+            fi
+          fi
+
+          base=$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/app/build.gradle.kts | head -n1)
+          if [[ -z "$base" ]]; then
+            echo "::error::Could not read versionName from app/app/build.gradle.kts"
+            exit 1
+          fi
+
+          # Existing fork release tags: "<sha>\trefs/tags/v<base>-fork.<id>[^{}]"
+          tags=$(git ls-remote --tags origin 'refs/tags/v*-fork.*')
+
+          if [[ "$publish" == "true" ]]; then
+            existing=$(awk -v sha="$GITHUB_SHA" '$1 == sha { t = $2; sub("^refs/tags/", "", t); sub("\\^\\{\\}$", "", t); print t; exit }' <<<"$tags")
+            if [[ -n "$existing" ]]; then
+              echo "::notice::Commit $GITHUB_SHA is already released as $existing; nothing to do."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Build id = UTC yyyyMMddHH. It is the versionCode, so it must be strictly greater than
+          # every previous fork release, even if several builds land within the same hour.
+          id=$(date -u +%Y%m%d%H)
+          latest=$(grep -oE -- '-fork\.[0-9]{10}' <<<"$tags" | cut -c7- | sort -n | tail -n1 || true)
+          if [[ -n "$latest" && "$id" -le "$latest" ]]; then
+            id=$(date -u -d "@$(( $(date -u -d "${latest:0:8} ${latest:8:2}:00" +%s) + 3600 ))" +%Y%m%d%H)
+          fi
+          if (( id >= 2100000000 )); then
+            echo "::error::Build id $id exceeds the maximum Android versionCode"
+            exit 1
+          fi
+
+          version="${base}-fork.${id}"
+          echo "FORK_BUILD_ID=$id" >> "$GITHUB_ENV"
+          {
+            echo "skip=false"
+            echo "publish=$publish"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version: $version (versionCode $id), publish: $publish"
+
+      - name: Set up JDK 21
+        if: steps.plan.outputs.skip != 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        if: steps.plan.outputs.skip != 'true'
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          # Open-source (MIT) cache provider; the default "enhanced" provider is proprietary.
+          cache-provider: basic
+
+      - name: Decode keystore
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KEYSTORE" ]]; then
+            echo "::error::The KEYSTORE secret is not set; refusing to build an APK with the debug key."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/keystore"
+          printf '%s' "$KEYSTORE" | base64 -di > "$RUNNER_TEMP/keystore/keystore.jks"
+
+      - name: Build APK
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: ./gradlew assembleDefaultFork
+
+      - name: Check and rename APK
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          out=app/app/build/outputs/apk/default/fork
+          built=$(jq -r '.elements[0].versionName' "$out/output-metadata.json")
+          if [[ "$built" != "$VERSION" ]]; then
+            echo "::error::Built versionName '$built' does not match the planned release version '$VERSION'"
+            exit 1
+          fi
+
+          apksigner="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)/apksigner"
+          "$apksigner" verify --print-certs "$out/app-default-fork.apk" | tee "$RUNNER_TEMP/certs.txt"
+          if grep -q 'CN=Android Debug' "$RUNNER_TEMP/certs.txt"; then
+            echo "::error::The APK is signed with the debug key; check the keystore secrets."
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "$out/app-default-fork.apk" "dist/kvaesitso-fork-$VERSION.apk"
+          rm -f "$RUNNER_TEMP/keystore/keystore.jks"
+
+      - name: Upload APK artifact
+        if: steps.plan.outputs.skip != 'true' && steps.plan.outputs.publish != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: kvaesitso-fork-${{ steps.plan.outputs.version }}
+          path: dist/kvaesitso-fork-${{ steps.plan.outputs.version }}.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: steps.plan.outputs.skip != 'true' && steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="Kvaesitso fork build of upstream ${VERSION%%-fork.*} from commit ${GITHUB_SHA}.
+          Package: de.mm20.launcher2.fork (installs alongside the official app). See FORK.md."
+          gh release create "v$VERSION" "dist/kvaesitso-fork-$VERSION.apk" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --notes "$notes" \
+            --latest
